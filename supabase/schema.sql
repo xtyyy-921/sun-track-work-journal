@@ -52,3 +52,31 @@ drop trigger if exists set_user_state_updated_at on public.user_states;
 create trigger set_user_state_updated_at
 before update on public.user_states
 for each row execute function public.set_user_state_updated_at();
+
+-- 私有附件存储：对象路径的第一段必须是当前登录用户 ID。
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('work-files', 'work-files', false, 10485760)
+on conflict (id) do update
+set public = excluded.public,
+    file_size_limit = excluded.file_size_limit;
+
+drop policy if exists "Users can read their own work files" on storage.objects;
+create policy "Users can read their own work files"
+  on storage.objects for select to authenticated
+  using (bucket_id = 'work-files' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+drop policy if exists "Users can upload their own work files" on storage.objects;
+create policy "Users can upload their own work files"
+  on storage.objects for insert to authenticated
+  with check (bucket_id = 'work-files' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+drop policy if exists "Users can update their own work files" on storage.objects;
+create policy "Users can update their own work files"
+  on storage.objects for update to authenticated
+  using (bucket_id = 'work-files' and (storage.foldername(name))[1] = (select auth.uid())::text)
+  with check (bucket_id = 'work-files' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+drop policy if exists "Users can delete their own work files" on storage.objects;
+create policy "Users can delete their own work files"
+  on storage.objects for delete to authenticated
+  using (bucket_id = 'work-files' and (storage.foldername(name))[1] = (select auth.uid())::text);

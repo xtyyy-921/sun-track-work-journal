@@ -19,7 +19,10 @@ let cloudSyncStatus = cloudConfigured ? "loading" : "local";
 let lastSyncedPayload = "";
 let authMode = "login";
 let passwordRecoveryMode = false;
+let fileOperationBusy = false;
 const hadLegacyLocalStateAtBoot = Boolean(localStorage.getItem(STORAGE_KEY));
+const FILE_BUCKET = "work-files";
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
 const palette = ["#E4EBF1", "#E8EFE8", "#F1E7D3", "#EBE5EF", "#EAE7DF"];
 
@@ -77,10 +80,12 @@ function normalizeState(rawState) {
     project.reviewers ||= [];
     project.nodes ||= [];
     project.publicFiles ||= [];
+    for (const file of project.publicFiles) file.kind ||= "link";
     for (const node of project.nodes) {
       node.notes ||= [];
       node.tasks ||= [];
       node.files ||= [];
+      for (const file of node.files) file.kind ||= "link";
     }
   }
   return loaded;
@@ -128,6 +133,90 @@ function saveState() {
     clearTimeout(cloudSyncTimer);
     cloudSyncTimer = window.setTimeout(syncCloudState, 650);
   }
+}
+
+function formatFileSize(bytes) {
+  if (!Number.isFinite(Number(bytes))) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileKindLabel(file) {
+  return file.kind === "upload" ? formatFileSize(file.size) || "云端文件" : "外部链接";
+}
+
+function safeFileName(name) {
+  const dot = name.lastIndexOf(".");
+  const extension = dot > -1 ? name.slice(dot).replace(/[^a-zA-Z0-9.]/g, "") : "";
+  const base = (dot > -1 ? name.slice(0, dot) : name)
+    .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "file";
+  return `${base}${extension.slice(0, 12)}`;
+}
+
+function storagePathFor(file, project, node = null) {
+  return [
+    cloudSession.user.id,
+    project.id,
+    node ? `nodes/${node.id}` : "public",
+    `${Date.now()}-${uid("upload")}-${safeFileName(file.name)}`,
+  ].join("/");
+}
+
+async function uploadAttachment(file, project, node = null) {
+  if (!cloudEnabled || !cloudSession) throw new Error("请先登录云端账号后再上传文件");
+  if (!file || !file.size) throw new Error("请选择要上传的文件");
+  if (file.size > MAX_UPLOAD_BYTES) throw new Error("单个文件暂时不能超过 10 MB");
+  const path = storagePathFor(file, project, node);
+  const { error } = await cloudClient.storage.from(FILE_BUCKET).upload(path, file, {
+    cacheControl: "3600",
+    upsert: false,
+  });
+  if (error) throw error;
+  return {
+    id: uid(node ? "file" : "public-file"),
+    kind: "upload",
+    name: file.name,
+    storagePath: path,
+    size: file.size,
+    mimeType: file.type || "application/octet-stream",
+    uploadedAt: new Date().toISOString(),
+  };
+}
+
+async function openStoredFile(file) {
+  if (file.kind !== "upload") {
+    window.open(file.url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  if (!cloudEnabled || !cloudSession) {
+    showToast("请先登录云端账号");
+    return;
+  }
+  const { data, error } = await cloudClient.storage
+    .from(FILE_BUCKET)
+    .createSignedUrl(file.storagePath, 60, { download: file.name });
+  if (error) {
+    showToast(`文件打开失败：${error.message}`);
+    return;
+  }
+  window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+}
+
+async function removeStoredFiles(files) {
+  const paths = files.filter((file) => file?.kind === "upload" && file.storagePath).map((file) => file.storagePath);
+  if (!paths.length || !cloudEnabled || !cloudSession) return;
+  const { error } = await cloudClient.storage.from(FILE_BUCKET).remove(paths);
+  if (error) throw error;
+}
+
+function projectStoredFiles(project) {
+  return [
+    ...(project.publicFiles || []),
+    ...(project.nodes || []).flatMap((node) => node.files || []),
+  ];
 }
 
 function cloudUserProfile(user) {
@@ -782,7 +871,7 @@ function renderProject() {
           <div class="info-item"><dt>项目时间</dt><dd>${formatDate(project.startDate)}<br />至 ${formatDate(project.endDate)}</dd></div>
           <div class="info-item public-files-summary">
             <dt><span>公共资料</span>${canEdit && project.status !== "closed" ? `<button class="back-link compact" data-action="open-public-files">管理</button>` : ""}</dt>
-            <dd>${project.publicFiles?.length ? project.publicFiles.map((file) => `<a class="public-file-link" href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer">▣ ${escapeHtml(file.name)}</a>`).join("") : "暂无文件"}</dd>
+            <dd>${project.publicFiles?.length ? project.publicFiles.map((file) => `<button class="public-file-link link-button" data-action="open-attachment" data-file-scope="public" data-file-id="${file.id}">▣ ${escapeHtml(file.name)}</button>`).join("") : "暂无文件"}</dd>
           </div>
         </dl>
       </aside>
@@ -819,8 +908,8 @@ function renderNodeWorkspace(project, node, canEdit = projectPermission(project)
       ${node.tasks.length ? node.tasks.map(renderNodeTask).join("") : `<p class="muted">这个节点还没有任务。</p>`}
     </div>
     <div class="workspace-section">
-      <div class="section-heading"><h3>文件与链接</h3>${canEdit && project.status !== "closed" ? `<button class="back-link" data-action="open-file-modal">添加链接 ＋</button>` : ""}</div>
-      ${node.files.length ? node.files.map((file) => `<div class="content-card" data-context-type="file" data-context-id="${file.id}"><span data-edit-type="file" data-edit-id="${file.id}" title="双击编辑">▣ ${escapeHtml(file.name)}</span></div>`).join("") : `<p class="muted">这个节点还没有文件或链接。</p>`}
+      <div class="section-heading"><h3>文件与链接</h3>${canEdit && project.status !== "closed" ? `<button class="back-link" data-action="open-file-modal">添加文件 ＋</button>` : ""}</div>
+      ${node.files.length ? node.files.map((file) => `<div class="content-card attachment-card" data-context-type="file" data-context-id="${file.id}"><button class="attachment-main" data-action="open-attachment" data-file-scope="node" data-file-id="${file.id}"><span class="public-file-icon">${file.kind === "upload" ? "⇩" : "↗"}</span><span><strong>${escapeHtml(file.name)}</strong><small>${escapeHtml(fileKindLabel(file))}</small></span></button></div>`).join("") : `<p class="muted">这个节点还没有文件或链接。</p>`}
     </div>`;
 }
 
@@ -946,7 +1035,7 @@ function requestConfirmation(options) {
   state.confirmation = options;
 }
 
-function acceptConfirmation() {
+async function acceptConfirmation() {
   const confirmation = state.confirmation;
   state.confirmation = null;
   if (!confirmation) return;
@@ -954,10 +1043,19 @@ function acceptConfirmation() {
     projectById().status = "closed";
     showToast("项目已结题");
   } else if (confirmation.kind === "delete-entity") {
+    if (confirmation.entityType === "file") {
+      const context = findFile(confirmation.entityId);
+      if (context) await removeStoredFiles([context.file]);
+    } else if (confirmation.entityType === "node") {
+      const node = nodeById(projectById(), confirmation.entityId);
+      if (node) await removeStoredFiles(node.files || []);
+    }
     deleteEntity(confirmation.entityType, confirmation.entityId);
     showToast(`${confirmation.entityLabel}已删除`);
   } else if (confirmation.kind === "delete-public-file") {
     const project = projectById();
+    const file = (project.publicFiles || []).find((item) => item.id === confirmation.fileId);
+    if (file) await removeStoredFiles([file]);
     project.publicFiles = (project.publicFiles || []).filter(
       (file) => file.id !== confirmation.fileId,
     );
@@ -966,6 +1064,7 @@ function acceptConfirmation() {
   } else if (confirmation.kind === "delete-project") {
     const index = state.projects.findIndex((project) => project.id === confirmation.projectId);
     if (index < 0) return;
+    await removeStoredFiles(projectStoredFiles(state.projects[index]));
     state.projects.splice(index, 1);
     if (state.activeProjectId === confirmation.projectId) {
       const nextProject = accessibleProjects()[0];
@@ -1085,9 +1184,13 @@ function taskModal() {
 
 function fileModal() {
   return modalShell(
-    "添加文件链接",
-    "本地测试版先保存文件名称和链接，后续接入真实文件上传。",
-    `<form id="file-form"><div class="form-grid"><div class="field full"><label>文件或资料名称</label><input required name="name" /></div><div class="field full"><label>链接</label><input required name="url" placeholder="https://..." /></div></div><div class="modal-actions"><button type="button" class="button" data-action="close-modal">取消</button><button class="button primary">添加链接</button></div></form>`,
+    "添加文件",
+    "上传到当前流程节点，或保存一个外部资料链接。",
+    `<div class="attachment-form-grid">
+      <form id="node-upload-form" class="attachment-form"><h3>上传本地文件</h3><p class="muted">文件会保存到你的私有云端空间，单个最大 10 MB。</p><div class="field"><label>选择文件</label><input required type="file" name="file" /></div><button class="button primary" ${cloudEnabled ? "" : "disabled"}>上传文件</button></form>
+      <form id="file-form" class="attachment-form"><h3>添加外部链接</h3><div class="field"><label>资料名称</label><input required name="name" /></div><div class="field"><label>链接</label><input required type="url" name="url" placeholder="https://..." /></div><button class="button">添加链接</button></form>
+    </div><div class="modal-actions"><button type="button" class="button" data-action="close-modal">关闭</button></div>`,
+    true,
   );
 }
 
@@ -1107,10 +1210,10 @@ function publicFilesModal() {
           ? files
               .map(
                 (file) => `<div class="public-file-row">
-                  <a href="${escapeHtml(file.url)}" target="_blank" rel="noopener noreferrer">
-                    <span class="public-file-icon">▣</span>
-                    <span><strong>${escapeHtml(file.name)}</strong><small>${escapeHtml(file.url)}</small></span>
-                  </a>
+                  <button class="attachment-main" data-action="open-attachment" data-file-scope="public" data-file-id="${file.id}">
+                    <span class="public-file-icon">${file.kind === "upload" ? "⇩" : "↗"}</span>
+                    <span><strong>${escapeHtml(file.name)}</strong><small>${escapeHtml(fileKindLabel(file))}</small></span>
+                  </button>
                   <div class="inline-actions">
                     <button class="icon-button" data-action="edit-public-file" data-file-id="${file.id}" title="编辑">✎</button>
                     <button class="icon-button danger" data-action="delete-public-file" data-file-id="${file.id}" title="删除">×</button>
@@ -1122,13 +1225,16 @@ function publicFilesModal() {
       }
     </div>
     <div class="public-file-form-heading"><h3>${editing ? "编辑资料" : "添加新资料"}</h3></div>
-    <form id="public-file-form"><div class="form-grid">
+    ${editing ? `<form id="public-file-form"><div class="form-grid">
       <div class="field full"><label>资料名称</label><input required name="name" value="${escapeHtml(editing?.name || "")}" placeholder="例如：迎新工作分工表.xlsx" /></div>
-      <div class="field full"><label>资料链接</label><input required name="url" value="${escapeHtml(editing?.url || "")}" placeholder="https://..." /></div>
+      ${editing.kind === "upload" ? `<div class="field full"><label>文件信息</label><input readonly value="${escapeHtml(fileKindLabel(editing))}" /></div>` : `<div class="field full"><label>资料链接</label><input required type="url" name="url" value="${escapeHtml(editing.url || "")}" placeholder="https://..." /></div>`}
     </div><div class="modal-actions">
-      ${editing ? `<button type="button" class="button" data-action="cancel-public-file-edit">取消编辑</button>` : `<button type="button" class="button" data-action="close-modal">关闭</button>`}
-      <button class="button primary">${editing ? "保存修改" : "添加资料"}</button>
-    </div></form>`,
+      <button type="button" class="button" data-action="cancel-public-file-edit">取消编辑</button><button class="button primary">保存修改</button>
+    </div></form>` : `<div class="attachment-form-grid">
+      <form id="public-upload-form" class="attachment-form"><h3>上传本地文件</h3><p class="muted">适合 Word、Excel、PDF 等项目模板，单个最大 10 MB。</p><div class="field"><label>选择文件</label><input required type="file" name="file" /></div><button class="button primary" ${cloudEnabled ? "" : "disabled"}>上传文件</button></form>
+      <form id="public-file-form" class="attachment-form"><h3>添加外部链接</h3><div class="field"><label>资料名称</label><input required name="name" placeholder="例如：通知原文" /></div><div class="field"><label>资料链接</label><input required type="url" name="url" placeholder="https://..." /></div><button class="button">添加链接</button></form>
+    </div><div class="modal-actions"><button type="button" class="button" data-action="close-modal">关闭</button></div>`}`,
+    true,
   );
 }
 
@@ -1218,11 +1324,11 @@ function editModal() {
     if (!context) return "";
     const { file } = context;
     return modalShell(
-      "编辑文件链接",
-      "修改资料名称或目标链接。",
+      file.kind === "upload" ? "重命名文件" : "编辑文件链接",
+      file.kind === "upload" ? "修改网站中显示的文件名称，云端文件内容不会改变。" : "修改资料名称或目标链接。",
       `<form id="edit-file-form"><div class="form-grid">
         <div class="field full"><label>文件或资料名称</label><input required name="name" value="${escapeHtml(file.name)}" /></div>
-        <div class="field full"><label>链接</label><input required name="url" value="${escapeHtml(file.url)}" /></div>
+        ${file.kind === "upload" ? `<div class="field full"><label>文件信息</label><input readonly value="${escapeHtml(fileKindLabel(file))}" /></div>` : `<div class="field full"><label>链接</label><input required type="url" name="url" value="${escapeHtml(file.url)}" /></div>`}
       </div><div class="modal-actions"><button type="button" class="button" data-action="close-modal">取消</button><button class="button primary">保存修改</button></div></form>`,
     );
   }
@@ -1428,6 +1534,12 @@ document.addEventListener("click", async (event) => {
       confirmText: "确认删除",
       tone: "danger",
     });
+  } else if (action === "open-attachment") {
+    const project = projectById();
+    const file = target.dataset.fileScope === "public"
+      ? (project.publicFiles || []).find((item) => item.id === target.dataset.fileId)
+      : findFile(target.dataset.fileId)?.file;
+    if (file) await openStoredFile(file);
   }
   else if (action === "open-note") state.activeNoteId = target.dataset.noteId;
   else if (action === "close-note") state.activeNoteId = null;
@@ -1577,7 +1689,11 @@ document.addEventListener("click", async (event) => {
   } else if (action === "cancel-confirmation") {
     state.confirmation = null;
   } else if (action === "accept-confirmation") {
-    acceptConfirmation();
+    try {
+      await acceptConfirmation();
+    } catch (error) {
+      showToast(`删除失败：${error.message}`);
+    }
   } else if (action === "move-node") {
     const project = projectById();
     const index = project.nodes.findIndex(
@@ -1928,11 +2044,38 @@ document.addEventListener("submit", async (event) => {
   } else if (event.target.id === "file-form") {
     nodeById(projectById()).files.push({
       id: uid("file"),
+      kind: "link",
       name: data.get("name"),
       url: data.get("url"),
     });
     state.modal = null;
     showToast("链接已添加");
+  } else if (["node-upload-form", "public-upload-form"].includes(event.target.id)) {
+    if (fileOperationBusy) return;
+    const project = projectById();
+    const node = event.target.id === "node-upload-form" ? nodeById(project) : null;
+    const file = event.target.elements.file.files[0];
+    const button = event.target.querySelector("button");
+    fileOperationBusy = true;
+    button.disabled = true;
+    button.textContent = "正在上传……";
+    try {
+      const attachment = await uploadAttachment(file, project, node);
+      if (node) {
+        node.files.push(attachment);
+        state.modal = null;
+      } else {
+        project.publicFiles ||= [];
+        project.publicFiles.push(attachment);
+        state.modal = "public-files";
+      }
+      project.updatedAt = new Date().toISOString().slice(0, 10);
+      showToast("文件已上传到云端");
+    } catch (error) {
+      showToast(`上传失败：${error.message}`);
+    } finally {
+      fileOperationBusy = false;
+    }
   } else if (event.target.id === "public-file-form") {
     const project = projectById();
     project.publicFiles ||= [];
@@ -1942,11 +2085,12 @@ document.addEventListener("submit", async (event) => {
         : null;
     if (editing) {
       editing.name = data.get("name");
-      editing.url = data.get("url");
+      if (editing.kind !== "upload") editing.url = data.get("url");
       showToast("公共资料已更新");
     } else {
       project.publicFiles.push({
         id: uid("public-file"),
+        kind: "link",
         name: data.get("name"),
         url: data.get("url"),
       });
@@ -2003,7 +2147,7 @@ document.addEventListener("submit", async (event) => {
   } else if (event.target.id === "edit-file-form") {
     const context = findFile(state.editing.id);
     context.file.name = data.get("name");
-    context.file.url = data.get("url");
+    if (context.file.kind !== "upload") context.file.url = data.get("url");
     state.modal = null;
     state.editing = null;
     showToast("文件链接修改已保存");

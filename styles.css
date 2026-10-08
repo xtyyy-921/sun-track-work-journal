@@ -1159,6 +1159,66 @@ h3 {
   color: var(--blue);
 }
 
+.link-button,
+.attachment-main {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.attachment-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 12px;
+}
+
+.attachment-main strong,
+.attachment-main small {
+  display: block;
+}
+
+.attachment-main small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.attachment-card {
+  display: flex;
+  align-items: center;
+}
+
+.attachment-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.attachment-form {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #fbfaf7;
+}
+
+.attachment-form h3,
+.attachment-form p {
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .attachment-form-grid { grid-template-columns: 1fr; }
+}
+
 .public-file-list {
   display: grid;
   gap: 10px;
